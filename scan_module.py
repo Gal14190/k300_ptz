@@ -3,94 +3,129 @@ import math
 import pyproj
 import json
 
-from cameraDriver import moveCameraDriver 
+from cameraDriver import moveCameraDriver
+
 
 class scanModule:
-    def __init__(self):
-        self.camera = moveCameraDriver()
-
-    def parse_json(self, json_file):
-        """load a json file"""
-        with open(json_file, 'r') as file:
-            data = json.load(file)
-        return data
+    def __init__(self,server_yolo ,camera_cord_long,camera_cord_lat, camera_altitude):
+        # self.camera = moveCameraDriver()
+        self.server_yolo=server_yolo
+        self.camera_cord_lat = camera_cord_lat
+        self.camera_cord_long = camera_cord_long 
+        self.camera_altitude = camera_altitude
+        # self.camera.move(0,0)
+        sleep(3)
         
+    def get_coords(img):
+        x_min = img["x_min"]
+        y_min = img["y_min"]
+        x_max = img["x_max"]
+        y_max = img["y_max"]
+        return x_min,y_min,x_max,y_max
+    
+    def get_center_object(image_cord):
+        return image_cord['center_x'],image_cord['center_y']
 
-    def calc_camera_to_target_rotation_by_gps(self, camera_coord,target_coord):
+    def calc_camera_to_target_rotation_by_gps(self, target_long, target_lat, target_alt):
         """"move camera to focus on target location"""
         geodesic = pyproj.Geod(ellps='WGS84')
-        pan,_,distance = geodesic.inv(camera_coord[1], camera_coord[0], target_coord[1], target_coord[0])
-        tilt = math.degrees(math.atan2(target_coord[2]-camera_coord[2],distance))
+        pan,_,distance = geodesic.inv( self.camera_cord_long, self.camera_cord_lat,target_long, target_lat)
+        tilt = math.degrees(math.atan2(target_alt-self.camera_altitude,distance))
+
+        if pan < 0:
+            pan += 360
+        print("rotate camera to:",pan, tilt)
         return pan,tilt  
 
-            
     def auto_zoom(self, x_min, y_min, x_max, y_max, w, h, thresh):
-        bbx_area = (x_max-x_min)*(y_max-y_min)
-        image_area = w*h
-        bbx_area_ratio = bbx_area/image_area
-        eps=0.1
-        while abs(bbx_area_ratio - thresh)>eps:
-            if bbx_area_ratio > thresh: #zoom  out
-                zoom_factor=thresh-bbx_area_ratio
-            else: #zoom in
-                zoom_factor=bbx_area_ratio-thresh
+        bbx_area = (x_max - x_min) * (y_max - y_min)
+        image_area = w * h
+        bbx_area_ratio = bbx_area / image_area
+        eps = 0.1
+        while abs(bbx_area_ratio - thresh) > eps:
+            if bbx_area_ratio > thresh:  # zoom  out
+                zoom_factor = thresh - bbx_area_ratio
+            else:  # zoom in
+                zoom_factor = bbx_area_ratio - thresh
 
             self.camera.step_zoom(zoom_factor)
-            #get json_ai
-            #get x_min, y_min, x_max, y_max
-            #re calculate bbx from new json data
-            x_min    = image_cord["x_min"]
-            center_y    = image_cord["y_min"]
-            h           = image_cord["x_max"]
-            w           = image_cord["y_max"]
+            sleep(1)
+            image_cord = self.get_detection()
+            if image_cord is None:
+                return True ## reset scanning
+            x_min,y_min,x_max,y_max=self.get_coords(image_cord)
+
             bbx_area = (x_min, y_min, x_max, y_max)
             bbx_area_ratio = bbx_area / image_area
+            
 
+    def get_detection(self):
+        image_cord=self.server_yolo.getYOLO_data()
+        count_not_found=0
+        while image_cord["yolo_detection"] == False:
+            image_cord=self.server_yolo.getYOLO_data()
+            count_not_found+=1
+        ## object detection not found for some duration -> zoom out & start again. 
+            if count_not_found==10:
+                return None
+        return image_cord
 
     def locking_on_target(self, center_x, center_y, h, w):
-        MINIMAL_MOVE=5
-        eps=2
-        cross_x,cross_y = w/2, h/2
-        pix_w,pix_h= cross_x-center_x, cross_y-center_y
-        prev_x,prev_y=center_x, center_y
-        ##get json_ai .put timeout 
-        # center_x, center_y= json.data[0,1]
+        reset=False
+        eps = 10
+        cross_x, cross_y = w / 2, h / 2
 
-        pixels_per_angle_x, pixels_per_angle_y=5,5
-        while abs(center_x-cross_x)>eps or abs((center_y-cross_y)>eps):
-            print(center_x,center_y)
-            print(pixels_per_angle_x, pixels_per_angle_y)
-            pix_w,pix_h=cross_x-center_x, cross_y-center_y
-            print("move_x",pix_w,"move_y",pix_h)
-            prev_x,prev_y=center_x, center_y
-            if(pix_w <=10 and pix_h<=10):
-                break
-            if (abs(pix_w) >10):
-                pan = self.camera.get_anglePan() + (-pix_w/pix_w)*pixels_per_angle_x
-                center_x -= 5
-                dif_x=center_x-prev_x
-                if dif_x!=0:
-                    pixels_per_angle_x=dif_x/pixels_per_angle_x
+        angle_per_pixel_x, angle_per_pixel_y = (
+            1 / 40,
+            1 / 40,
+        )  # move 1 degree for each 40 pixels
+        while not reset:
+            pix_w, pix_h = center_x - cross_x, cross_y - center_y
+            print("object location:", center_x, center_y)
+            print("move_x", pix_w, "move_y", pix_h)
+            print("camera pan tilt move:", angle_per_pixel_x, angle_per_pixel_x)
+
+            if abs(pix_w) > eps:
+                pan = self.camera.get_anglePan() + (pix_w * angle_per_pixel_x)
             else:
-                pan=self.camera.get_anglePan()
-            if (abs(pix_h) >10):
-                tilt = self.camera.get_angleTilt() + (pix_h/pix_h)*pixels_per_angle_y
-                center_y += 5
-                dif_y=center_y-prev_y
-                if dif_y!=0:
-                    pixels_per_angle_y=dif_y/pixels_per_angle_y
+                pan = self.camera.get_anglePan()
+
+            if abs(pix_h) > eps:
+                tilt = self.camera.get_angleTilt() + (pix_h * angle_per_pixel_y)
             else:
-                tilt=self.camera.get_angleTilt()
-                
+                tilt = self.camera.get_angleTilt()
+
             self.camera.move(pan, tilt)
-            #get json_ai... if not get-exit and re-scan
-            # center_x, center_y= json.data[0,1]
-            print(center_x-prev_x,center_y-prev_y)
+            ## save current object position
+            prev_x, prev_y = center_x, center_y
+            ## get new frame detection
+            
+            image_cord = self.get_detection()
+            if image_cord is None:
+                return True ## reset scanning
+                    
+            center_x,center_y=self.get_center_object(image_cord)
+            
+            ##calculate difference movement between 2 frames
+            dif_x, dif_y = (
+                prev_x - center_x,
+                prev_y - center_y,
+            ) 
+            ##calculate how much pixels moved by pixels_per_angle_y angles
+            if dif_x != 0:
+                angle_per_pixel_x = (pix_w * angle_per_pixel_x) / dif_x
+            else:
+                angle_per_pixel_x *= 4
+            if dif_y != 0:
+                angle_per_pixel_y = (pix_h * angle_per_pixel_y) / dif_y
+            else:
+                angle_per_pixel_y *= 4
+            ## calculate distance between target and cross
+            pix_w, pix_h = center_x - cross_x, cross_y - center_y
+        
 
-
-
-    def scan_alg(self, target_coord):
-        """ drone scanning algorithm
+    def scan_alg(self,target_long, target_lat, target_alt):
+        """drone scanning algorithm
         1) get gps location from sdr
         2) calculate camera rotation and move camera
         3) zoom in continuously until yolo model detect object
@@ -98,33 +133,36 @@ class scanModule:
         Args:
             target_coord : gps coordinates of target object (from sdr)
         """
-
-        camera_coord = [32.158901, 34.802920, 0.0]
-        pan,tilt=self.calc_camera_to_target_rotation_by_gps(camera_coord,target_coord)
-        self.camera.move(pan,tilt)
-
+        print("Scanning")
+        ## rotate camera according sdr coordinates detection
+        pan, tilt = self.calc_camera_to_target_rotation_by_gps(target_long, target_lat, target_alt)
+        self.camera.move(pan, tilt)
         print(f"pan: {pan} tilt: {tilt}")
-        #set zoom to zero4
-        self.camera.set_zoom(0)
-
-
+        TARGE_SCREEN_RATIO=1/3
         while True:
-            print(self.camera.get_zoom())
+            self.camera.set_zoom(0)
+            print("start zooming in, zoom=",self.camera.get_zoom())
             while self.camera.get_zoom() < 1:
                 self.camera.step_zoom(0.1)
-                sleep(5)
-                ##try to get json_ai
-                # center_x    = image_cord["center_x"]
-                # center_y    = image_cord["center_y"]
-                # h           = image_cord["height"]
-                # w           = image_cord["width"]
-
-                # center_x, center_y, h, w=[400,200,500,500]
-                ##if get_json_ai succeeded go to locking
-                # self.locking_on_target(center_x, center_y, h, w)
-            self.camera.set_zoom(0)
-
-    # pan: 82.46763098664051 tilt: 0.9530980278179486
-    def test_camera(self):
-        self.camera.move(82.46763098664051,0.9530980278179486)
-        
+                print("zoon: ",self.camera.get_zoom())
+                sleep(1)
+                print("try get detection")
+                image_cord=self.server_yolo.getYOLO_data()
+                if image_cord["yolo_detection"] == False: ## object not found -> zoom in
+                    continue
+                #object found -> start locking on it
+                x_min,y_min,x_max,y_max=self.get_coords(image_cord)
+                h,w=image_cord["height"],image_cord["width"]
+                reset_scanning=self.auto_zoom(x_min,y_min,x_max,y_max,w,h,TARGE_SCREEN_RATIO)
+                ## zoom out and start again
+                if reset_scanning==True:
+                    break
+                center_x, center_y=self.get_center_object(image_cord)
+                reset_scanning=self.locking_on_target(center_x, center_y, h, w)
+                ## zoom out and start again
+                if reset_scanning==True:
+                    break
+                
+                
+    def get_msg(self):
+        return self.server_yolo.getYOLO_data()
